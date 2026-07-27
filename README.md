@@ -26,7 +26,7 @@ FiF 录音器 <- getUserMedia 音频流 <- 浏览器注入钩子
 克隆项目：
 
 ```powershell
-git clone
+git clone https://github.com/EnderPPT/VoxPilot.git
 Set-Location VoxPilot
 ```
 
@@ -133,6 +133,17 @@ VoxPilot/
 
 CPU 模式下首次加载模型和长文本合成都会较慢。可配置兼容的 CUDA 版 PyTorch，
 并确保 TTS 模型已完整下载。
+
+# 免责声明
+
+- **仅供个人学习用途**。
+
+# 致谢与引用
+
+- [microsoft/playwright](https://github.com/microsoft/playwright)
+- [coqui-ai/TTS](https://github.com/coqui-ai/TTS)
+- [Aurorabili/fuckfif](https://github.com/Aurorabili/fuckfif)
+- [1z2y3x4w5/fif_gui](https://github.com/1z2y3x4w5/fif_gui)
 
 ## License
 
