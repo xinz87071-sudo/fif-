@@ -1,0 +1,8 @@
+{
+  "username": "",
+  "password": "",
+  "skip_score": 80,
+  "target_voice_path": "draft/target_voice.wav",
+  "skip_rules": [],
+  "level_type_rules": []
+}
