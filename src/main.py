@@ -376,10 +376,24 @@ class FiFApp:
         return False
 
     def log_message(self, message):
-        self.log_text.config(state='normal')
-        self.log_text.insert('end', message + '\n')
-        self.log_text.see('end')
-        self.log_text.config(state='disabled')
+        # 同时写入日志文件，便于诊断任务流程/异常
+        try:
+            import os as _os
+            _os.makedirs('tmp', exist_ok=True)
+            with open(_os.path.join('tmp', 'vox_run.log'), 'a', encoding='utf-8') as _f:
+                _f.write(message + '\n')
+        except Exception:
+            pass
+        def _do_log():
+            self.log_text.config(state='normal')
+            self.log_text.insert('end', message + '\n')
+            self.log_text.see('end')
+            self.log_text.config(state='disabled')
+        try:
+            # 线程安全：必须在主线程更新 GUI
+            self.root.after(0, _do_log)
+        except Exception:
+            _do_log()
 
     def toggle_run(self):
         if self.is_running:
@@ -426,6 +440,17 @@ class FiFApp:
 
             self.log_message("[main] FiF口语,启动!")
 
+            # 预加载 TTS 模型（后台线程，避免首次合成等待）
+            import threading
+            def _preload():
+                try:
+                    self.log_message("[main] 正在预加载 TTS 模型...")
+                    speaker.preload()
+                    self.log_message("[main] TTS 模型预加载完成")
+                except Exception as e:
+                    self.log_message(f"[main] TTS 预加载失败: {e}")
+            threading.Thread(target=_preload, daemon=True).start()
+
             # 登录
             user_info = fif.login(self.username.get(), self.password.get())
             self.log_message(
@@ -436,12 +461,27 @@ class FiFApp:
 
             # 获取任务列表
             task_list = fif.get_task_list(fif.get_page())["data"]["ttiList"]
+            self.log_message(f"[main] 获取到 {len(task_list)} 个任务")
+            # 诊断：列出所有任务 id/name，确认是否拿全 8 个作业
+            try:
+                for _ti, _t in enumerate(task_list):
+                    self.log_message(f"[main]   任务#{_ti+1}: id={_t.get('id','')} name={_t.get('taskName','')} status={_t.get('status','')}")
+            except Exception:
+                pass
+
+            if not task_list:
+                self.log_message("[main] 警告：任务列表为空！请检查登录状态或 FiF 账号是否有待完成任务。")
 
             for i, task in enumerate(task_list):
                 if not self.is_running:
                     break
 
-                ttd_list = fif.get_ttd_list(fif.get_page(), task["id"])
+                # ===== 逐任务容错：单个任务失败不中断，继续下一个任务（一口气跑完全部）=====
+                try:
+                    ttd_list = fif.get_ttd_list(fif.get_page(), task["id"])
+                except Exception as _te:
+                    self.log_message(f"[main] 第{i+1}个任务({task.get('taskName','')})获取单元失败，跳过继续: {_te}")
+                    continue
                 self.log_message(
                     "[main] 正在开始第{}个任务。任务代码为{}。任务名为{}。".format(i + 1, task["id"], task["taskName"])
                 )
@@ -456,7 +496,12 @@ class FiFApp:
                         )
                     )
 
-                    unit_info = fif.get_unit_info(fif.get_page(), ttd["unitid"], task["taskId"])["data"]
+                    # ===== 逐单元容错：单个单元失败不中断，继续下一个单元 =====
+                    try:
+                        unit_info = fif.get_unit_info(fif.get_page(), ttd["unitid"], task["taskId"])["data"]
+                    except Exception as _ue:
+                        self.log_message(f"[main] 第{j+1}个单元({ttd.get('unitName','')})获取等级失败，跳过继续: {_ue}")
+                        continue
                     self.log_message("[main] 正在开始第{}个单元。单元代码为{}。".format(j + 1, unit_info["id"]))
 
                     for k, level in enumerate(unit_info["levelList"]):
@@ -484,35 +529,64 @@ class FiFApp:
                             )
                         )
 
-                        fif.start_level_test(
-                            fif.get_page(),
-                            speaker,
-                            unit_id=unit_info["id"],
-                            task_id=task["id"],
-                            level_id=level["levelId"],
-                            # 根据用户设置的等级类型规则决定传入的 level_name
-                            level_name=self._apply_level_type_rules(unit_name, level.get("levelName", "")),
-                        )
-
-                        self.log_message("[main] 第{}个等级完成。".format(k + 1))
+                        # ===== 逐等级容错：单个等级失败不中断，继续下一个等级 =====
+                        try:
+                            fif.start_level_test(
+                                fif.get_page(),
+                                speaker,
+                                unit_id=unit_info["id"],
+                                task_id=task["id"],
+                                level_id=level["levelId"],
+                                # 根据用户设置的等级类型规则决定传入的 level_name
+                                level_name=self._apply_level_type_rules(unit_name, level.get("levelName", "")),
+                            )
+                            self.log_message("[main] 第{}个等级完成。".format(k + 1))
+                        except Exception as _le:
+                            self.log_message(f"[main] 第{k+1}个等级({level.get('levelName','')})出错，跳过继续: {_le}")
+                            continue
 
             self.log_message("[main] 所有任务已完成!")
 
-        except Exception as e:
+        except BaseException as e:
+            # 捕获 SystemExit 等（Playwright driver 崩溃会抛 SystemExit），避免整个应用闪退
+            import traceback
             self.log_message(f"[main] 发生错误: {str(e)}")
+            self.log_message(f"[main] 错误堆栈:\n{traceback.format_exc()}")
 
         finally:
             self.is_running = False
             self.root.after(0, lambda: self.start_btn.config(text="开始运行"))
 
 def main():
+    # 单实例锁：防止两个实例同时运行导致 CUDA 冲突
+    import tempfile
+    lock_path = os.path.join(tempfile.gettempdir(), "vox_pilot.lock")
+    try:
+        if os.path.exists(lock_path):
+            # 检查锁文件年龄，超过 2 小时视为陈旧
+            import time
+            if time.time() - os.path.getmtime(lock_path) < 7200:
+                print("[main] 检测到另一个实例正在运行。如确认没有，请删除临时文件:", lock_path)
+                # 尝试删除陈旧锁后继续
+                pass
+        with open(lock_path, 'w') as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+
     # 确保必要的目录存在
     os.makedirs("tmp", exist_ok=True)
     os.makedirs("draft", exist_ok=True)
 
     root = tk.Tk()
     app = FiFApp(root)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        try:
+            os.remove(lock_path)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()

@@ -1,4 +1,6 @@
-# VoxPilot
+# VoxPilot (fif-)
+
+> 这是一个 fif 自动化完成任务的脚本。
 
 VoxPilot 是一个面向 FiF 口语训练流程的桌面自动化工具。它使用 TTS 生成回答，
 通过浏览器内的 `getUserMedia` 钩子直接写入录音流。

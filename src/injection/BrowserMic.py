@@ -79,8 +79,12 @@ _HOOK_BODY = r"""
         return writer;
       }
       if (!hasGen) return null;
+      // 显式清理旧 track 和 writer，防止内存泄漏
       if (writer) {
         try { writer.releaseLock(); } catch (e) {}
+      }
+      if (generatorTrack) {
+        try { generatorTrack.stop(); } catch (e) {}
       }
       generatorTrack = new MediaStreamTrackGenerator({ kind: 'audio' });
       writer = generatorTrack.writable.getWriter();
@@ -93,6 +97,8 @@ _HOOK_BODY = r"""
     const writeSilence = async (seconds) => {
       const w = await ensureWriter();
       if (!w) return;
+      // 背压控制：队列满时不写，防止 AudioData 对象无限累积
+      if (w.desiredSize !== null && w.desiredSize <= -10) return;
       const n = Math.max(1, Math.floor(TARGET_RATE * seconds));
       const data = new Float32Array(n); // zeros
       const audioData = new AudioData({
@@ -108,8 +114,7 @@ _HOOK_BODY = r"""
       audioData.close();
     };
 
-    // 保活：空闲时写静音，避免 track 被当成 stalled。
-    // 语音写入期间必须暂停，否则静音会插进每个语音块之间，拉长录音。
+    // 保活：空闲时写极短静音，避免 track 被当成 stalled。
     let keepAliveTimer = null;
     let keepAlivePending = null;
     let isInjecting = false;
@@ -117,10 +122,10 @@ _HOOK_BODY = r"""
       if (keepAliveTimer || !hasGen) return;
       keepAliveTimer = setInterval(() => {
         if (isInjecting || keepAlivePending) return;
-        keepAlivePending = writeSilence(0.02)
+        keepAlivePending = writeSilence(0.05)
           .catch(() => {})
           .finally(() => { keepAlivePending = null; });
-      }, 20);
+      }, 500);  // 500ms 间隔，极低干扰
     };
 
     // ---- 路径 B：AudioContext 强制 16k + MediaStreamDestination ----
@@ -170,16 +175,25 @@ _HOOK_BODY = r"""
      * 播放原始 float32 mono PCM（小端 base64）。
      * sampleRate 应为 16000。
      */
-    window.__fifPlayPcmRaw = async (b64, sampleRate, numFrames) => {
+    window.__fifPlayPcmRaw = async (b64, sampleRate, numFrames, fmt) => {
+      const __deadline = performance.now() + 12000; // 12秒硬超时
       const binary = atob(b64);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      // Float32 view；注意对齐
-      const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-      const floats = new Float32Array(ab);
+      
+      let floats;
+      if (fmt === 'int16') {
+        // int16 解码：2 bytes per sample，减半内存占用
+        const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+        floats = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) floats[i] = int16[i] / 32768.0;
+      } else {
+        // float32 解码（兼容旧格式）
+        const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        floats = new Float32Array(ab);
+      }
       const n = Math.min(numFrames || floats.length, floats.length);
       const sr = sampleRate || TARGET_RATE;
-
       // ---- Generator 路径：按真实时间写入 16k AudioData ----
       if (hasGen) {
         isInjecting = true;
@@ -187,7 +201,7 @@ _HOOK_BODY = r"""
           const w = await ensureWriter();
           if (keepAlivePending) await keepAlivePending;
           startKeepAlive();
-          const frameSize = 1600; // 100ms @ 16k
+          const frameSize = 1600; // 100ms @ 16k（标准帧尺寸，平滑无间隙）
           let offset = 0;
           const t0 = performance.now();
           let framesWritten = 0;
@@ -210,16 +224,18 @@ _HOOK_BODY = r"""
             audioData.close();
             framesWritten += copy.length;
             offset = end;
-            // 实时节拍：已写时长 vs 墙上时钟
+            // 实时节拍：已写时长 vs 墙上时钟（保证平滑无卡顿）
             const shouldMs = (framesWritten / sr) * 1000;
             const elapsed = performance.now() - t0;
             const delay = shouldMs - elapsed;
-            if (delay > 4) {
+            if (delay > 2) {
               await new Promise((r) => setTimeout(r, delay));
             }
           }
           // 尾部再写 80ms 静音，避免被截断
           await writeSilence(0.08);
+          // 显式释放大数组引用，帮助 GC
+          floats.fill(0);
           return n / sr;
         } finally {
           isInjecting = false;
@@ -371,15 +387,28 @@ INSTALL_HOOK_JS = "() => {\n" + _HOOK_BODY + "\n}"
 INIT_SCRIPT_JS = "(function() {\n" + _HOOK_BODY + "\n})();"
 
 PLAY_RAW_JS = r"""
-async ({ b64, sampleRate, numFrames }) => {
+async ({ b64, sampleRate, numFrames, fmt }) => {
   if (typeof window.__fifPlayPcmRaw !== 'function') return 0;
   try {
     if (typeof window.__fifResumeMic === 'function') await window.__fifResumeMic();
-    return await window.__fifPlayPcmRaw(b64, sampleRate, numFrames);
+    return await window.__fifPlayPcmRaw(b64, sampleRate, numFrames, fmt);
   } catch (e) {
     console.error('[fif] play raw failed', e);
     return 0;
   }
+}
+"""
+
+# 清理 JS 端音频缓冲，释放内存
+CLEANUP_JS = r"""
+() => {
+  try {
+    // 清理全局引用的大型数组
+    if (window.__fifLastPcm) { window.__fifLastPcm = null; }
+    // 强制释放 AudioData 相关引用
+    if (window.__fifPlayBufs) { window.__fifPlayBufs.length = 0; }
+    return true;
+  } catch(e) { return false; }
 }
 """
 
@@ -396,7 +425,11 @@ STATUS_JS = r"""
 
 
 def _wav_to_f32_mono_16k(wav_path: str) -> Tuple[bytes, int, int]:
-    """读 wav → float32 mono @ 16kHz，返回 (raw_bytes, sample_rate, num_frames)。"""
+    """读 wav → float32 mono @ 16kHz，返回 (raw_bytes, sample_rate, num_frames)。
+
+    最小化后处理：仅重采样 + 音量归一化。
+    过度后处理（EQ/压缩/静音填充/降速）可能干扰评分系统。
+    """
     if sf is None or np is None:
         raise RuntimeError("需要 soundfile 与 numpy")
 
@@ -415,11 +448,40 @@ def _wav_to_f32_mono_16k(wav_path: str) -> Tuple[bytes, int, int]:
             x_old = np.linspace(0.0, 1.0, num=len(mono), endpoint=False)
             x_new = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
             mono = np.interp(x_new, x_old, mono).astype(np.float32)
+
+    # 仅归一化音量（不做任何 EQ/压缩/静音填充）
+    peak = float(np.max(np.abs(mono)))
+    if peak > 0.001:
+        mono = mono * (0.85 / peak)
+
     mono = np.clip(mono, -1.0, 1.0).astype(np.float32)
     return mono.tobytes(), target, int(mono.shape[0])
 
 
+_HOOK_INSTALLED = {}  # page id -> True，避免重复安装
+
+
 def install_browser_mic_hook(page: Any) -> int:
+    page_id = id(page)
+    if _HOOK_INSTALLED.get(page_id):
+        # 已安装过，只检查是否有新 frame 需要安装
+        try:
+            frames = list(page.frames)
+        except Exception:
+            frames = []
+        ok = 0
+        for frame in frames:
+            try:
+                if frame.evaluate("() => !!window.__fifMicReady"):
+                    ok += 1
+                else:
+                    # 新 frame 需要安装
+                    if frame.evaluate(INSTALL_HOOK_JS):
+                        ok += 1
+            except Exception:
+                continue
+        return ok if ok > 0 else len(frames)
+
     ok = 0
     try:
         frames = list(page.frames)
@@ -436,7 +498,13 @@ def install_browser_mic_hook(page: Any) -> int:
             except Exception:
                 name = ""
             if any(k in str(name).lower() for k in ("fif", "kyxl", "assessment", "dekaron")):
+                err_str = str(e).lower()
+                if "target crashed" in err_str or "frame was detached" in err_str:
+                    print(f"[BrowserMic] 浏览器崩溃，跳过安装: {e}")
+                    return 0
                 print(f"[BrowserMic] 安装失败 {name}: {e}")
+    if ok > 0:
+        _HOOK_INSTALLED[page_id] = True
     return ok
 
 
@@ -486,6 +554,7 @@ def play_wav_in_browser(page: Any, wav_path: str, extra_wait_ms: int = 500) -> b
         print(f"[BrowserMic] 读取/重采样失败: {e}")
         return False
 
+    # float32 传输（无损，避免 int16 量化噪声）
     b64 = base64.b64encode(raw).decode("ascii")
     dur_logic = nframes / float(sr)
 
@@ -494,14 +563,21 @@ def play_wav_in_browser(page: Any, wav_path: str, extra_wait_ms: int = 500) -> b
         print("[BrowserMic] 未安装到任何 frame")
         return False
 
-    statuses = browser_mic_status(page)
-    if statuses:
-        print(f"[BrowserMic] 钩子状态: {statuses}")
+    # 清理 JS 端旧缓冲（释放内存，防止累积）
+    try:
+        for frame in list(page.frames):
+            try:
+                frame.evaluate(CLEANUP_JS)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    payload = {"b64": b64, "sampleRate": sr, "numFrames": nframes}
+    payload = {"b64": b64, "sampleRate": sr, "numFrames": nframes, "fmt": "float32"}
     targets = _pick_play_frames(page)
     max_dur = 0.0
     played = 0
+    crashed = False
 
     for frame in targets:
         try:
@@ -512,19 +588,35 @@ def play_wav_in_browser(page: Any, wav_path: str, extra_wait_ms: int = 500) -> b
                 played += 1
                 max_dur = max(max_dur, float(dur))
         except Exception as e:
+            err_str = str(e).lower()
+            if "target crashed" in err_str or "frame was detached" in err_str:
+                print(f"[BrowserMic] 浏览器崩溃，停止注入: {e}")
+                crashed = True
+                break
+            if "execution context" in err_str:
+                print(f"[BrowserMic] 页面导航中，跳过此 frame: {e}")
+                continue
             print(f"[BrowserMic] frame 播放失败: {e}")
             continue
 
-    if played <= 0:
-        # 再试全部 frame
+    if not crashed and played <= 0:
+        # 再试全部 frame（但崩溃时不重试）
         for frame in list(page.frames):
             try:
                 dur = frame.evaluate(PLAY_RAW_JS, payload)
                 if dur and float(dur) > 0:
                     played += 1
                     max_dur = max(max_dur, float(dur))
-            except Exception:
+            except Exception as e:
+                err_str = str(e).lower()
+                if "target crashed" in err_str or "frame was detached" in err_str:
+                    crashed = True
+                    break
                 continue
+
+    if crashed:
+        print("[BrowserMic] 浏览器已崩溃，注入失败")
+        return False
 
     if played <= 0 or max_dur <= 0:
         print("[BrowserMic] 注入播放失败")

@@ -13,6 +13,10 @@ class Speaker:
         self.tts_solver = TTSSolver(tts_model_name, mode, target_voice_path)
         Path("tmp").mkdir(parents=True, exist_ok=True)
 
+    def preload(self) -> None:
+        """预加载 TTS 模型（可在后台线程调用）。"""
+        self.tts_solver.preload()
+
     def speak(self, text: str, page: Any = None) -> None:
         """合成文本并送入麦克风链路。
 
